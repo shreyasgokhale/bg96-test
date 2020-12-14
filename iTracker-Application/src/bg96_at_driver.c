@@ -2,32 +2,78 @@
 // Created by shreyas on 29.10.20.
 //
 
-#include "gps_at_driver.h"
+#include "bg96_at_driver.h"
 
 #define RETRY_DELAY 60
+#define PWR_GPRS_ON 6 // GPIO P0.06 ( Chip pin 8)
+#define GPRS_PWR_KEY  14 // GPIO P0.14 ( Chip pin 17)
+
+static bool init_bg96() {
+
+    int ret;
+
+//  Turn on Power supply to BG96
+    gpio_device = device_get_binding("GPIO_0");
+    ret = gpio_pin_configure(dev, PWR_GPRS_ON, GPIO_OUTPUT_ACTIVE);
+    ret &= gpio_pin_configure(dev, GPRS_PWR_KEY, GPIO_OUTPUT_ACTIVE);
+
+    if (!ret) return false;
+
+//    Init UART
+    uart_device = device_get_binding("UART_0");
+    uart_callback_set(uart_device, uart_data_handler, NULL);
+    uart_rx_enable(uart_device_0, recv_buf, sizeof(recv_buf), 120);
+
+//    Turn on other modules/sensors
+
+    return true;
+}
 
 
+static int send_uart(char *data[]) {
 
-// From Asset tracker application
-// https://github.com/nrfconnect/sdk-nrf/blob/91463a03f60dfd37980cd190b34f5fde73cefc33/applications/asset_tracker/src/main.c#L648
+//    Ref: test/drivers/uart/
+    /* Verify uart_irq_tx_ready() */
 
-// TODO: Fixing all fns
+    /*
+    * Note that TX IRQ may be disabled, but uart_irq_tx_ready() may
+    * still return true when ISR is called for another UART interrupt,
+    * hence additional check for i < DATA_SIZE.
+    */
 
-static void gps_handler(const struct device *dev, struct gps_event *evt)
-{
-    gps_last_active_time = k_uptime_get();
 
-    switch (evt->type) {
+    if (uart_irq_tx_ready(dev) && tx_data_idx < DATA_SIZE) {
+        /* We arrive here by "tx ready" interrupt, so should always
+         * be able to put at least one byte into a FIFO. If not,
+         * well, we'll fail test.
+         */
+        if (uart_fifo_fill(dev,
+                           (uint8_t * ) & fifo_data[tx_data_idx++], 1) > 0) {
+            data_transmitted = true;
+            char_sent++;
+        }
+
+        if (tx_data_idx == DATA_SIZE) {
+            /* If we transmitted everything, stop IRQ stream,
+             * otherwise main app might never run.
+             */
+            uart_irq_tx_disable(dev);
+        }
+    }
+
+}
+
+
+static void gsm_send_command(const struct device *dev, struct gsm_command *cmd) {
+
+    switch (cmd->type) {
         case GPS_EVT_SEARCH_STARTED:
             LOG_INF("GPS_EVT_SEARCH_STARTED");
-            gps_control_set_active(true);
-            ui_led_set_pattern(UI_LED_GPS_SEARCHING);
-            gps_last_search_start_time = k_uptime_get();
+            gps_control_set_active(true);gps_last_search_start_time = k_uptime_get();
             break;
         case GPS_EVT_SEARCH_STOPPED:
             LOG_INF("GPS_EVT_SEARCH_STOPPED");
             gps_control_set_active(false);
-            ui_led_set_pattern(UI_CLOUD_CONNECTED);
             break;
         case GPS_EVT_SEARCH_TIMEOUT:
             LOG_INF("GPS_EVT_SEARCH_TIMEOUT");
@@ -40,7 +86,7 @@ static void gps_handler(const struct device *dev, struct gps_event *evt)
             break;
         case GPS_EVT_PVT_FIX:
             LOG_INF("GPS_EVT_PVT_FIX");
-            gps_time_set(&evt->pvt);
+            gps_time_set(&cmd->pvt);
             break;
         case GPS_EVT_NMEA:
             /* Don't spam logs */
@@ -48,8 +94,8 @@ static void gps_handler(const struct device *dev, struct gps_event *evt)
         case GPS_EVT_NMEA_FIX:
             LOG_INF("Position fix with NMEA data");
 
-            memcpy(gps_data.buf, evt->nmea.buf, evt->nmea.len);
-            gps_data.len = evt->nmea.len;
+            memcpy(gps_data.buf, cmd->nmea.buf, cmd->nmea.len);
+            gps_data.len = cmd->nmea.len;
             gps_cloud_data.data.buf = gps_data.buf;
             gps_cloud_data.data.len = gps_data.len;
             gps_cloud_data.ts = k_uptime_get();
@@ -85,7 +131,7 @@ static void gps_handler(const struct device *dev, struct gps_event *evt)
             /* Send A-GPS request with short delay to avoid LTE network-
              * dependent corner-case where the request would not be sent.
              */
-            memcpy(&agps_request, &evt->agps_request, sizeof(agps_request));
+            memcpy(&agps_request, &cmd->agps_request, sizeof(agps_request));
             k_delayed_work_submit_to_queue(&application_work_q,
                                            &send_agps_request_work,
                                            K_SECONDS(1));
@@ -99,75 +145,17 @@ static void gps_handler(const struct device *dev, struct gps_event *evt)
 }
 
 
-static void gps_time_set(struct gps_pvt *gps_data)
-{
-    /* Change datetime.year and datetime.month to accommodate the
-     * correct input format.
-     */
-    struct tm gps_time = {
-            .tm_year = gps_data->datetime.year - 1900,
-            .tm_mon = gps_data->datetime.month - 1,
-            .tm_mday = gps_data->datetime.day,
-            .tm_hour = gps_data->datetime.hour,
-            .tm_min = gps_data->datetime.minute,
-            .tm_sec = gps_data->datetime.seconds,
-    };
+bool gsm_send_test(void) {
 
-    date_time_set(&gps_time);
-}
+//  TODO: Implement logic which checks return of each command from UART and returns if not okay.
 
+    send_uart("ATI");
 
+//  TODO: AT+QCFG for config
+//  Source https://github.com/RAKWireless/RUI_Platform_Firmware_GCC/blob/master/RUI/Source/driver/bg96.c
 
-static void send_agps_request(struct k_work *work)
-{
-    ARG_UNUSED(work);
-
-#if defined(CONFIG_AGPS)
-    int err;
-	static int64_t last_request_timestamp;
-
-/* Request A-GPS data no more often than every hour (time in milliseconds). */
-#define AGPS_UPDATE_PERIOD (60 * 60 * 1000)
-
-	if ((last_request_timestamp != 0) &&
-	    (k_uptime_get() - last_request_timestamp) < AGPS_UPDATE_PERIOD) {
-		LOG_WRN("A-GPS request was sent less than 1 hour ago");
-		return;
-	}
-
-	LOG_INF("Sending A-GPS request");
-
-	err = gps_agps_request(agps_request, GPS_SOCKET_NOT_PROVIDED);
-	if (err) {
-		LOG_ERR("Failed to request A-GPS data, error: %d", err);
-		return;
-	}
-
-	last_request_timestamp = k_uptime_get();
-
-	LOG_INF("A-GPS request sent");
-#endif /* defined(CONFIG_AGPS) */
-}
-
-static void set_gps_enable(const bool enable)
-{
-    int32_t delay_ms = 0;
-    bool changing = (enable != gps_control_is_enabled());
-    if (changing) {
-        if (enable) {
-            LOG_INF("Starting GPS");
-            /* GPS will be started from the device config work
-             * handler AFTER the config has been sent to the cloud
-             */
-        } else {
-            LOG_INF("Stopping GPS");
-            gps_control_stop(0);
-            /* Allow time for the gps to be stopped before
-             * attemping to send the config update
-             */
-            k_sleep(K_SECONDS(RETRY_DELAY));
-            //            k_delay
-        }
-    }
-
+    send_uart("AT+QISEND=TEST_DATA");
+    send_uart("AT+QISEND=1,75");
+    send_uart("$GPGGA,134303.00,3418.040101,N,10855.904676,E,1,07,1.0,418.5,M,-28.0,M,,*4A");
+    send_uart("AT+QISEND=1,170");
 }
